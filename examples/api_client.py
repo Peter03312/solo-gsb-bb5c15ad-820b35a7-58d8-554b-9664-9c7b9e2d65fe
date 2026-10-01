@@ -77,6 +77,10 @@ class Client:
     def solution(self, sid: int):
         return self._request("GET", f"/solutions/{sid}")
 
+    def rehearse(self, sid: int, req: dict):
+        """基于已保存方案 sid 在目标修订上预演（不落库）。"""
+        return self._request("POST", f"/solutions/{sid}/rehearsals", data=req)
+
     def revoke(self, plugin: str, version: str, reason: str):
         return self._request(
             "POST", f"/plugins/{plugin}/versions/{version}/revoke",
@@ -161,6 +165,41 @@ def main() -> int:
     show(f"在旧修订 {old_rev} 重放", st,
          {"revision": replay["revision"], "alpha": replay["selection"]["alpha"]["version"]})
     assert replay["selection"]["alpha"]["version"] == "2.0.0"
+
+    # 预演：基于已保存方案 sid，在旧修订上把运行环境整体覆盖为 3.9
+    # （最小变动优先：alpha/beta 需一起换版；结果不保存）
+    st, _, preview = c.rehearse(sid, {
+        "revision": old_rev,
+        "runtimes": [{"name": "python", "spec": "3.9.*"}]})
+    show(f"预演方案 {sid} @修订{old_rev}（覆盖 python 3.9）", st, {
+        "saved": preview["saved"],
+        "selection": {k: v["version"] for k, v in preview["selection"].items()},
+        "changes": preview["changes"],
+        "diff": preview["diff"],
+    })
+    assert st == 200 and preview["saved"] is False
+    assert preview["selection"]["alpha"]["version"] == "1.5.0"
+    assert preview["selection"]["beta"]["version"] == "1.0.0"
+    assert preview["changes"]["changed"] == 2
+    # 预演不产生新方案：原 sid 仍可查且内容不变
+    st, _, same = c.solution(sid)
+    assert same["selection"]["alpha"]["version"] == "2.0.0"
+
+    # 预演无解：409 + 结构化原因（不保存部分方案）
+    st, _, perr = c.rehearse(sid, {
+        "revision": old_rev,
+        "runtimes": [{"name": "python", "spec": "2.7.*"}]})
+    show("预演无解（409 + conflicts，不落库）", st, perr)
+    assert st == 409 and perr["detail"]["code"] == "unsatisfiable"
+
+    # 预演入参非法：方案不存在 404 / 修订不存在 400 / 非法范围 400
+    st, _, _ = c.rehearse(999999, {"revision": old_rev})
+    assert st == 404, st
+    st, _, _ = c.rehearse(sid, {"revision": 999999})
+    assert st == 400, st
+    st, _, _ = c.rehearse(sid, {"revision": old_rev,
+                                "targets": {"beta": "~=1"}})
+    assert st == 400, st
 
     # 摘要不符必须拒绝
     bad = {"plugin": "alpha", "version": "9.9.9", "sha256": "0" * 64,

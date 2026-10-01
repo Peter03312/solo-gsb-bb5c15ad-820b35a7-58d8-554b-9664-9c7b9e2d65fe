@@ -57,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `plugindb` | 数据库凭据 |
 | `PACKAGE_DIR` | `/data/packages` | 安装包内容寻址存储根目录（按 sha256 前两位分桶） |
 | `MAX_UPLOAD_BYTES` | `1073741824`（1 GiB） | 单次上传大小上限 |
-| `API_TOKEN` | 空 | 非空时写接口（发布/撤销/求解）要求 `Authorization: Bearer <token>`；读接口始终开放 |
+| `API_TOKEN` | 空 | 非空时写接口（发布/撤销）与计算接口（求解/预演）要求 `Authorization: Bearer <token>`；纯读接口始终开放。预演不落库，但与求解同口径鉴权 |
 | `API_PORT` | `8080` | 宿主机映射端口（compose） |
 
 ---
@@ -138,6 +138,70 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 
 `install_order` 为依赖拓扑序（被依赖者先安装）。
 
+### 预演（基于历史方案，最小变动、不保存）
+
+`POST /api/v1/solutions/{solution_id}/rehearsals`
+
+在不产生任何持久化副作用的前提下，用**已保存方案**作为基线，到指定的
+**目标目录修订**上重新求一份完整方案：
+
+```json
+{
+  "revision": 6,
+  "runtimes": [{"name": "python", "spec": "3.9.*"}],
+  "targets": {"data-toolkit": ">=2"}
+}
+```
+
+- 路径参数 `solution_id` 必须是已保存方案；请求体 `revision` 为**目标修订号
+  （必填）**。方案不存在 → **404**，目标修订不存在 → **400**。
+- `runtimes` / `targets` **缺省或为 `null` 时整体沿用原方案请求**；一旦提供
+  （包括空数组 / 空对象）即**整体覆盖**该部分，未覆盖部分仍沿用原请求
+  （`targets` 不允许覆盖为空对象；范围语法非法 → **400/422 拒绝**）。
+- 预演**只从目标修订内可见（未撤销）版本**中求满足**传递依赖、运行环境、
+  互斥、无环**的完整方案；约束规则与普通求解完全一致。
+- **首要目标：相对原方案变动的插件数最少**——新增、移除、换版各计一次，
+  版本相同即“保留”（计 0）；移除仅发生在新请求（覆盖后的目标与传递依赖）
+  不再需要该插件时。平手沿用现有确定性版本选择规则（MRV + 版本降序 +
+  插件名升序），因此相同输入在同一修订下结果稳定。
+- **不保存任何结果**：成功返回 `saved=false`，失败返回与求解同款的
+  结构化原因（无解 **409**、依赖环 **422**），**不写入部分方案**，也不影响
+  原方案与既有缓存。因为预演只读固定修订快照，后续发布/撤销不会改变某次
+  历史预演结果（重放同一 `solution_id` + `revision` + 覆盖入参必得同结果）。
+- 普通求解、历史方案查询与缓存语义保持不变。
+
+响应示例：
+
+```json
+{
+  "baseline_solution_id": 7,
+  "baseline_revision": 4,
+  "revision": 6,
+  "saved": false,
+  "request_hash": "1a2b…",
+  "runtimes_overridden": true,
+  "targets_overridden": false,
+  "effective_request": {
+    "revision": 6,
+    "runtimes": [{"name": "python", "spec": "3.9.*"}],
+    "targets": {"data-toolkit": ">=2"}
+  },
+  "selection": { "…同普通求解 selection，且 revoked 均为 false…" },
+  "install_order": ["numpy", "data-toolkit"],
+  "diff": [
+    {"plugin": "data-toolkit", "change": "changed",
+     "from_version": "3.0.0", "to_version": "2.4.1"},
+    {"plugin": "numpy", "change": "changed",
+     "from_version": "2.1.0", "to_version": "1.26.4"}
+  ],
+  "changes": {"kept": 0, "added": 0, "removed": 0, "changed": 2, "total": 2}
+}
+```
+
+`diff[].change` 取值：`kept`（保留同版本）、`added`（新增）、
+`removed`（移除）、`changed`（换版）；`changes.total` 即新增+移除+换版数
+（= 首要目标所最小化的值）。`install_order` 仍为依赖优先拓扑序。
+
 ### 撤销
 
 `POST /api/v1/plugins/{plugin}/versions/{version}/revoke`
@@ -157,6 +221,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | POST | `/plugins/{name}/versions` | 发布版本（multipart：`metadata` + `package`），201/409/422 |
 | POST | `/plugins/{name}/versions/{ver}/revoke` | 撤销版本 |
 | POST | `/solutions` | 求解并保存方案；409 无解 / 422 依赖环 |
+| POST | `/solutions/{id}/rehearsals` | 基于历史方案在目标修订预演（最小变动、不保存）；404 方案不存在 / 400 修订或覆盖非法 / 409 无解 / 422 环 |
 | GET  | `/solutions/{id}` | 查询历史方案（含当前撤销标记） |
 | GET  | `/revisions` | 目录修订列表（最新在前） |
 | GET  | `/revisions/{id}` | 单个修订 |
@@ -194,7 +259,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 启动服务后任选其一：
 
 ```bash
-# bash + curl：发布 4 个版本、求解、缓存、无解、撤销、历史查询、旧修订重放、下载
+# bash + curl：发布 4 个版本、求解、缓存、无解、撤销、历史查询、旧修订重放、预演、下载
 BASE=http://localhost:8080 bash examples/api-examples.sh
 
 # 纯标准库 Python（离线机器无需安装 requests）
@@ -221,6 +286,13 @@ curl -X POST http://localhost:8080/api/v1/solutions \
   -H 'Content-Type: application/json' \
   -d '{"runtimes":[{"name":"python","spec":"3.11.*"}],
        "targets":{"data-toolkit":">=3"}}'
+
+# 预演：基于已保存方案 7，在修订 6 上整体覆盖运行环境为 python 3.9
+# （最小变动优先；不保存。runtimes/targets 省略或 null 即沿用原请求）
+curl -X POST http://localhost:8080/api/v1/solutions/7/rehearsals \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":6,
+       "runtimes":[{"name":"python","spec":"3.9.*"}]}'
 ```
 
 ---
@@ -230,7 +302,7 @@ curl -X POST http://localhost:8080/api/v1/solutions \
 核心版本规则、求解器与发布/撤销业务规则不依赖任何第三方库：
 
 ```bash
-python3 tests/test_solver.py        # 19 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性
+python3 tests/test_solver.py        # 29 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性、最小变动预演
 python3 tests/test_catalog_flow.py  # 5 用例：发布校验/不可改写/摘要拒绝/快照/撤销语义/请求哈希（内存仓储）
 ```
 
@@ -243,7 +315,8 @@ python3 tests/test_api.py
 
 覆盖：摘要不符拒绝、非法范围拒绝、同名同版本不可改写、传递求解与缓存、
 409 冲突明细不落部分方案、422 环、撤销只影响后续求解且历史方案带标记、
-下载校验头、互斥端到端等。
+下载校验头、互斥端到端，以及预演的全保留/换版/新增/移除差异、保留优先于
+升级、撤销后历史预演稳定、409/422/404/400 拒绝与不保存等。
 
 ---
 

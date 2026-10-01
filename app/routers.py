@@ -24,8 +24,8 @@ from .config import settings
 from .database import get_db
 from .models import CatalogRevision, Plugin, PluginVersion, Solution
 from .schemas import (
-    PublishMetadata, RevisionOut, RevokeIn, SolutionOut, SolveRequest,
-    VersionOut,
+    PublishMetadata, RehearsalOut, RehearseRequest, RevisionOut, RevokeIn,
+    SolutionOut, SolveRequest, VersionOut,
 )
 from .service import RequestError, annotate_revoked
 from .solver import CycleError, UnsatisfiableError
@@ -317,6 +317,79 @@ def get_solution(solution_id: int, db: Session = Depends(get_db)):
         selection=_ordered_selection(selection),
         install_order=row.install_order,
         created_at=row.created_at,
+    )
+
+
+# ------------------------------------------------------------ 预演（不保存）
+
+@router.post("/solutions/{solution_id}/rehearsals",
+             response_model=RehearsalOut, tags=["rehearse"])
+def rehearse_solution(solution_id: int, body: RehearseRequest,
+                      db: Session = Depends(get_db),
+                      authorization: str | None = Header(default=None)):
+    """基于已保存方案在目标修订上预演完整方案（不落库）。
+
+    可选地用完整目标插件约束 / 运行环境列表覆盖原请求，未覆盖部分沿用原
+    请求；求解只从目标修订的可见版本中取，并以相对原方案变动插件数最少为
+    首要目标。无解/环时返回与求解接口同款结构化原因，不保存任何部分方案。
+    """
+    _check_token(authorization)
+
+    # 与求解一致：整次预演只读同一目录修订快照（不写库，无需提交）
+    if db.bind.dialect.name == "postgresql":
+        db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+
+    try:
+        outcome = service.rehearse(
+            db,
+            solution_id=solution_id,
+            target_revision=body.revision,
+            runtimes_in=body.runtimes,
+            # schema 已把 targets 归一化为 dict 或 None
+            targets_in=body.targets,
+        )
+    except RequestError as e:
+        db.rollback()
+        msg = str(e)
+        status = 404 if "不存在" in msg else 400
+        raise HTTPException(status_code=status, detail=msg)
+    except (UnsatisfiableError, CycleError) as e:
+        db.rollback()
+        code = "dependency_cycle" if isinstance(e, CycleError) else "unsatisfiable"
+        status = 422 if isinstance(e, CycleError) else 409
+        raise HTTPException(status_code=status, detail={
+            "detail": str(e),
+            "code": code,
+            "baseline_solution_id": solution_id,
+            "revision": body.revision,
+            "request_hash": getattr(e, "request_hash", ""),
+            "conflicts": e.reasons,
+        })
+    except InvalidSpecifier as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return RehearsalOut(
+        baseline_solution_id=outcome.baseline_solution_id,
+        baseline_revision=outcome.baseline_revision,
+        revision=outcome.revision,
+        saved=False,
+        request_hash=outcome.request_hash,
+        runtimes_overridden=outcome.runtimes_overridden,
+        targets_overridden=outcome.targets_overridden,
+        effective_request={
+            "revision": outcome.revision,
+            "runtimes": [
+                {"name": r.name, "spec": str(r.spec)}
+                for r in sorted(outcome.runtimes, key=lambda r: r.name)
+            ],
+            "targets": {k: outcome.targets[k]
+                        for k in sorted(outcome.targets)},
+        },
+        selection=_ordered_selection(outcome.selection),
+        install_order=outcome.install_order,
+        diff=sorted(outcome.diff, key=lambda d: d["plugin"]),
+        changes=outcome.changes,
     )
 
 

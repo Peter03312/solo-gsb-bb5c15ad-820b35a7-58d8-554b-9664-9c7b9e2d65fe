@@ -110,4 +110,27 @@ curl -fsS -D - -o "$tmpdir/dtk.bin" \
   "$API/plugins/data-toolkit/versions/3.0.0/download" | grep -Ei 'HTTP|x-sha256|content-disposition'
 echo "本地校验：$(sha256_file "$tmpdir/dtk.bin")"
 
+# 11) 预演（rehearsal）：基于已保存方案 $SOL_ID，在旧修订 $OLD_REV 上
+#     整体覆盖运行环境为 python 3.9 —— 最小变动优先，应整体回退到
+#     data-toolkit 2.4.1 / numpy 1.26.4；结果不落库。
+echo ">>> 预演：方案 $SOL_ID @修订 $OLD_REV，覆盖 python 3.9（最小变动）"
+curl -fsS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$OLD_REV,
+       \"runtimes\":[{\"name\":\"python\",\"spec\":\"3.9.*\"}]}" \
+  "$API/solutions/$SOL_ID/rehearsals" | python3 -m json.tool
+
+# 12) 预演：覆盖目标约束（只保留 numpy，不再要求 data-toolkit）
+echo ">>> 预演：覆盖目标为仅 numpy（data-toolkit 应 removed）"
+curl -fsS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$OLD_REV,
+       \"targets\":{\"numpy\":\"\"}}" \
+  "$API/solutions/$SOL_ID/rehearsals" | python3 -m json.tool
+
+# 13) 预演无解：python 2.7 下无兼容版本 -> 409 + 结构化冲突，且不保存
+echo ">>> 预演无解示例（409，不保存部分方案）"
+curl -sS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$OLD_REV,
+       \"runtimes\":[{\"name\":\"python\",\"spec\":\"2.7.*\"}]}" \
+  "$API/solutions/$SOL_ID/rehearsals" | python3 -m json.tool || true
+
 echo "全部示例执行完成。"

@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.solver import (
     Candidate, CycleError, RuntimeRequirement, Snapshot, installation_order,
-    solve, UnsatisfiableError,
+    rehearse, solve, UnsatisfiableError,
 )
 from app.version import (
     InvalidSpecifier, InvalidVersion, SpecifierSet, Version,
@@ -203,6 +203,97 @@ class SolverTests(unittest.TestCase):
         self.assertEqual(str(ok["a"].version), "1.0")
         with self.assertRaises(UnsatisfiableError):
             self.plan(snap, runtimes=[R("python", "3.10"), R("cuda", "10")], a="")
+
+
+class RehearseTests(unittest.TestCase):
+    """最小变动预演：保留 > 新增/移除/换版，平手沿用默认确定性选择。"""
+
+    def setUp(self):
+        # lib 1.0/2.0 均满足 app 的 >=1；默认求解选最新 lib 2.0
+        self.snap = Snapshot(7, {
+            "lib": (C("lib", "2.0"), C("lib", "1.0")),
+            "app": (C("app", "1.0", [("lib", ">=1")]),),
+            "extra": (C("extra", "1.0"),),
+        })
+        self.targets = {"app": SpecifierSet.parse("")}
+
+    def versions(self, plan):
+        return {p: str(c.version) for p, c in plan.items()}
+
+    def test_identical_request_keeps_everything(self):
+        base = {"app": "1.0", "lib": "2.0"}
+        plan = rehearse(self.snap, [], self.targets, base)
+        self.assertEqual(self.versions(plan), {"app": "1.0", "lib": "2.0"})
+
+    def test_keep_older_baseline_over_newest_default(self):
+        # 默认规则会升级到 lib 2.0，但保留 lib 1.0 可行（代价 0）
+        base = {"app": "1.0", "lib": "1.0"}
+        plan = rehearse(self.snap, [], self.targets, base)
+        self.assertEqual(self.versions(plan), {"app": "1.0", "lib": "1.0"})
+
+    def test_change_only_when_required(self):
+        # lib 1.0 在目标修订不可见（撤销模拟）：仅 lib 换版，app 保留
+        snap = Snapshot(8, {
+            "lib": (C("lib", "2.0"),),
+            "app": (C("app", "1.0", [("lib", ">=1")]),),
+        })
+        plan = rehearse(snap, [], self.targets, {"app": "1.0", "lib": "1.0"})
+        self.assertEqual(self.versions(plan), {"app": "1.0", "lib": "2.0"})
+
+    def test_removal_of_unneeded_plugin(self):
+        # 原方案含 extra，新目标不再需要且无人依赖 -> extra 被移除
+        base = {"app": "1.0", "lib": "2.0", "extra": "1.0"}
+        plan = rehearse(self.snap, [], self.targets, base)
+        self.assertEqual(self.versions(plan), {"app": "1.0", "lib": "2.0"})
+
+    def test_addition_for_new_target(self):
+        targets = {"app": SpecifierSet.parse(""),
+                   "extra": SpecifierSet.parse("")}
+        plan = rehearse(self.snap, [], targets, {"app": "1.0", "lib": "2.0"})
+        self.assertEqual(self.versions(plan),
+                         {"app": "1.0", "lib": "2.0", "extra": "1.0"})
+
+    def test_runtime_override_forces_minimal_downgrade_chain(self):
+        snap = Snapshot(9, {
+            "alpha": (C("alpha", "2.0", rts=[R("python", ">=3.10")]),
+                      C("alpha", "1.0", rts=[R("python", ">=3.8")])),
+            "beta": (C("beta", "2.0", [("alpha", ">=2")],
+                       rts=[R("python", ">=3.10")]),
+                     C("beta", "1.0", [("alpha", ">=1")],
+                       rts=[R("python", ">=3.8")])),
+        })
+        base = {"alpha": "2.0", "beta": "2.0"}
+        plan = rehearse(snap, [R("python", "3.9.*")],
+                        {"beta": SpecifierSet.parse("")}, base)
+        self.assertEqual(self.versions(plan), {"alpha": "1.0", "beta": "1.0"})
+
+    def test_no_baseline_matches_default_solution(self):
+        default_ = self.versions(solve(self.snap, [], self.targets))
+        plan = self.versions(rehearse(self.snap, [], self.targets, {}))
+        self.assertEqual(plan, default_)
+        self.assertEqual(plan["lib"], "2.0")  # 平手走版本降序
+
+    def test_deterministic(self):
+        base = {"app": "1.0", "lib": "1.0"}
+        first = self.versions(rehearse(self.snap, [], self.targets, base))
+        second = self.versions(rehearse(self.snap, [], self.targets, base))
+        self.assertEqual(first, second)
+
+    def test_unsat_raises_structured_error(self):
+        snap = Snapshot(8, {"lib": (C("lib", "2.0"),)})
+        with self.assertRaises(UnsatisfiableError) as cm:
+            rehearse(snap, [], {"lib": SpecifierSet.parse(">=9")},
+                     {"lib": "2.0"})
+        self.assertTrue(any(r["type"] == "no_matching_version"
+                            for r in cm.exception.reasons))
+
+    def test_cycle_raises_cycle_error(self):
+        snap = Snapshot(1, {
+            "a": (C("a", "1.0", [("b", ">=1")]),),
+            "b": (C("b", "1.0", [("a", ">=1")]),),
+        })
+        with self.assertRaises(CycleError):
+            rehearse(snap, [], {"a": SpecifierSet.parse("")}, {"a": "1.0"})
 
 
 if __name__ == "__main__":

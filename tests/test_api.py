@@ -225,6 +225,181 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(any(c["type"] == "mutex_conflict"
                             for c in r.json()["detail"]["conflicts"]))
 
+    # ----------------------------------------------------- 预演 rehearsals
+    def _publish_alpha_beta(self):
+        # python 3.10+ 新版；3.8/3.9 旧版；beta 新版依赖 alpha>=2
+        self.publish("alpha", "2.0.0", b"alpha2",
+                     rts=[{"name": "python", "spec": ">=3.10"}])
+        self.publish("alpha", "1.0.0", b"alpha1",
+                     rts=[{"name": "python", "spec": ">=3.8"}])
+        self.publish("beta", "2.0.0", b"beta2",
+                     deps=[{"plugin": "alpha", "spec": ">=2"}],
+                     rts=[{"name": "python", "spec": ">=3.10"}])
+        self.publish("beta", "1.0.0", b"beta1",
+                     deps=[{"plugin": "alpha", "spec": ">=1"}],
+                     rts=[{"name": "python", "spec": ">=3.8"}])
+
+    def _baseline_solution(self, plugin="beta"):
+        req = {"runtimes": [{"name": "python", "spec": "3.11.*"}],
+               "targets": {plugin: ""}}
+        r = self.client.post("/api/v1/solutions", json=req)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        return body["solution_id"], body["revision"], req
+
+    def test_rehearse_keeps_all_when_unchanged(self):
+        self._publish_alpha_beta()
+        sid, rev, _ = self._baseline_solution()
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals",
+                             json={"revision": rev})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body["saved"])
+        self.assertEqual(body["baseline_solution_id"], sid)
+        self.assertEqual(body["revision"], rev)
+        self.assertEqual(body["selection"]["alpha"]["version"], "2.0.0")
+        self.assertEqual(body["selection"]["beta"]["version"], "2.0.0")
+        kinds = {d["plugin"]: d["change"] for d in body["diff"]}
+        self.assertEqual(kinds, {"alpha": "kept", "beta": "kept"})
+        self.assertEqual(body["changes"]["total"], 0)
+        self.assertEqual(body["install_order"], ["alpha", "beta"])
+        # 预演不落库：方案表数量不变
+        from app import database
+        from app.models import Solution
+        with database.SessionLocal() as s:
+            n = s.query(Solution).count()
+        self.client.post(f"/api/v1/solutions/{sid}/rehearsals",
+                         json={"revision": rev})
+        with database.SessionLocal() as s:
+            self.assertEqual(s.query(Solution).count(), n)
+
+    def test_rehearse_runtime_override_minimal_change(self):
+        self._publish_alpha_beta()
+        sid, rev, _ = self._baseline_solution()
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals", json={
+            "revision": rev,
+            "runtimes": [{"name": "python", "spec": "3.9.*"}],
+        })
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["runtimes_overridden"])
+        self.assertFalse(body["targets_overridden"])
+        self.assertEqual(body["selection"]["alpha"]["version"], "1.0.0")
+        self.assertEqual(self._diff_map(body),
+                         {"alpha": "changed", "beta": "changed"})
+        self.assertEqual(body["changes"]["changed"], 2)
+        self.assertEqual(body["changes"]["total"], 2)
+
+    def test_rehearse_targets_override_add_and_remove(self):
+        self._publish_alpha_beta()
+        self.publish("extra", "1.0.0", b"extra")
+        # 基线方案包含 extra
+        req = {"runtimes": [{"name": "python", "spec": "3.11.*"}],
+               "targets": {"beta": "", "extra": ""}}
+        base = self.client.post("/api/v1/solutions", json=req).json()
+        sid, rev = base["solution_id"], base["revision"]
+
+        # 覆盖目标：去掉 extra -> removed；新增无需（此处演示 removed）
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals", json={
+            "revision": rev, "targets": {"beta": ""}})
+        self.assertEqual(r.status_code, 200, r.text)
+        dm = self._diff_map(r.json())
+        self.assertEqual(dm["extra"], "removed")
+        self.assertNotIn("extra", r.json()["selection"])
+        self.assertEqual(r.json()["changes"]["removed"], 1)
+
+        # 反向：基线无 extra，覆盖目标加入 -> added
+        sid2, rev2, _ = self._baseline_solution()
+        r = self.client.post(f"/api/v1/solutions/{sid2}/rehearsals", json={
+            "revision": rev2,
+            "targets": {"beta": "", "extra": ""}})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._diff_map(r.json())["extra"], "added")
+        self.assertEqual(r.json()["changes"]["added"], 1)
+
+    def test_rehearse_prefers_keep_over_upgrade(self):
+        # lib 1/2 均满足，基线在可复现条件下保存 lib 1.0（钉住 spec <2）
+        self.publish("keep-lib", "2.0.0", b"l2")
+        self.publish("keep-lib", "1.0.0", b"l1")
+        self.publish("keep-app", "1.0.0", b"a1",
+                     deps=[{"plugin": "keep-lib", "spec": ">=1"}])
+        base = self.client.post("/api/v1/solutions", json={
+            "targets": {"keep-app": "", "keep-lib": "<2"}}).json()
+        sid, rev = base["solution_id"], base["revision"]
+        # 预演放宽目标（仅 keep-app）：默认求解会选 lib 2.0，但保留 1.0 变动更少
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals",
+                             json={"revision": rev,
+                                   "targets": {"keep-app": ""}})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["selection"]["keep-lib"]["version"], "1.0.0")
+        self.assertEqual(r.json()["changes"]["total"], 0)
+
+    def test_rehearse_stable_after_later_revoke(self):
+        self._publish_alpha_beta()
+        sid, rev, _ = self._baseline_solution()
+        first = self.client.post(
+            f"/api/v1/solutions/{sid}/rehearsals",
+            json={"revision": rev}).json()
+        # 之后撤销 alpha 1.0.0（产生新修订）
+        rr = self.client.post(
+            "/api/v1/plugins/alpha/versions/1.0.0/revoke",
+            json={"reason": "x"})
+        self.assertEqual(rr.status_code, 200, rr.text)
+        # 固定在原修订重放：结果不变
+        second = self.client.post(
+            f"/api/v1/solutions/{sid}/rehearsals",
+            json={"revision": rev}).json()
+        self.assertEqual(second["selection"], first["selection"])
+        self.assertEqual(second["diff"], first["diff"])
+
+    def test_rehearse_unsat_409_and_cycle_422_no_partial(self):
+        self._publish_alpha_beta()
+        sid, rev, _ = self._baseline_solution()
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals", json={
+            "revision": rev,
+            "runtimes": [{"name": "python", "spec": "2.7.*"}]})
+        self.assertEqual(r.status_code, 409, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["code"], "unsatisfiable")
+        self.assertEqual(detail["baseline_solution_id"], sid)
+        self.assertTrue(detail["conflicts"])
+
+        # 非法范围 -> 400
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals", json={
+            "revision": rev, "targets": {"beta": "~=1"}})
+        self.assertEqual(r.status_code, 400, r.text)
+
+        # 空 targets 覆盖 -> 422（pydantic 校验）
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals", json={
+            "revision": rev, "targets": {}})
+        self.assertEqual(r.status_code, 422, r.text)
+
+        # 依赖环 -> 422
+        self.publish("rc-a", "1.0.0", b"a",
+                     deps=[{"plugin": "rc-b", "spec": ""}])
+        self.publish("rc-b", "1.0.0", b"b",
+                     deps=[{"plugin": "rc-a", "spec": ""}])
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals", json={
+            "revision": rev, "targets": {"rc-a": ""}})
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["code"], "dependency_cycle")
+
+    def test_rehearse_missing_solution_or_revision(self):
+        self._publish_alpha_beta()
+        sid, rev, _ = self._baseline_solution()
+        # 方案不存在 -> 404
+        r = self.client.post("/api/v1/solutions/999999/rehearsals",
+                             json={"revision": rev})
+        self.assertEqual(r.status_code, 404, r.text)
+        # 修订不存在 -> 400
+        r = self.client.post(f"/api/v1/solutions/{sid}/rehearsals",
+                             json={"revision": rev + 1000})
+        self.assertEqual(r.status_code, 400, r.text)
+
+    @staticmethod
+    def _diff_map(body):
+        return {d["plugin"]: d["change"] for d in body["diff"]}
+
 
 def _json(obj):
     import json

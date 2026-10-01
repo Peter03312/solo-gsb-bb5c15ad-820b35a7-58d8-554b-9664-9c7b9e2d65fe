@@ -14,6 +14,9 @@
   输出按插件名排序 —— 同一快照 + 同一请求必得同一方案。
 * 冲突驱动回溯：分支矛盾时记录“肇事插件”，回溯到最近的肇事选择点，
   保证算法完备（不会因贪心漏解）。
+
+:func:`rehearse` 在同一套约束之上改以“相对基线方案变动插件数最少”为首要
+目标（新增/移除/换版各计一次），平手沿用上述确定性规则，用于方案预演。
 """
 from __future__ import annotations
 
@@ -386,6 +389,155 @@ def solve(
             msg += "（同时存在其它冲突）"
         raise CycleError(msg, [{"type": "dependency_cycle", "cycle": cyc}] + non_cycle)
     raise UnsatisfiableError("不存在满足全部约束的安装方案", _dedup(reasons))
+
+
+def rehearse(
+    snapshot: Snapshot,
+    runtimes: Sequence[RuntimeRequirement],
+    targets: Dict[str, SpecifierSet],
+    baseline: Dict[str, str],
+) -> Dict[str, Candidate]:
+    """在 ``snapshot`` 上预演，并以相对 ``baseline`` 变动插件数最少为首要目标。
+
+    与 :func:`solve` 使用完全相同的约束（传递依赖、范围交集、运行环境、
+    互斥、无环），但优化目标变为：
+
+        cost = 新增插件数 + 移除插件数 + 换版插件数
+
+    其中换版只看“插件 -> 版本”是否一致；同版本即“保留”。不存在可行方案时
+    与 :func:`solve` 抛出同款 :class:`UnsatisfiableError` /
+    :class:`CycleError`（含结构化原因）。
+
+    平手规则沿用现有确定性选择：先用 :func:`solve` 取得“默认方案”作为上界，
+    再以与默认求解完全一致的枚举顺序（MRV + 版本降序 + 插件名升序）做
+    分支限界搜索，只在严格更优时替换上界——因此并列最优中保留默认规则选中的
+    方案，同快照同输入结果稳定。
+    """
+    base_versions: Dict[str, Version] = {}
+    for plugin, ver in baseline.items():
+        base_versions[plugin] = Version.parse(ver)
+
+    # 可行性与默认方案（首个完整可行解）：无可行方案时直接抛出结构化原因。
+    incumbent = solve(snapshot, runtimes, targets)
+
+    def plan_cost(plan: Dict[str, Candidate]) -> int:
+        cost = 0
+        for p, bv in base_versions.items():
+            got = plan.get(p)
+            if got is None or got.version != bv:
+                cost += 1  # 移除或换版
+        for p in plan:
+            if p not in base_versions:
+                cost += 1  # 新增
+        return cost
+
+    best_plan: Dict[str, Candidate] = dict(incumbent)
+    best_cost = plan_cost(best_plan)
+
+    st = _State(snapshot=snapshot, runtimes=tuple(runtimes))
+    for plugin in sorted(targets):
+        st.constraints.setdefault(plugin, []).append((targets[plugin], None))
+
+    def feasible_candidates(plugin: str) -> List[Candidate]:
+        specs = [s for s, _ in st.constraints.get(plugin, [])]
+        out: List[Candidate] = []
+        for c in snapshot.candidates_for(plugin):
+            if not all(s.contains(c.version) for s in specs):
+                continue
+            if _runtime_ok(c, st.runtimes) is not None:
+                continue
+            out.append(c)
+        return out
+
+    def conflicts_with(a: Candidate, b: Candidate) -> bool:
+        return b.plugin in a.conflicts or a.plugin in b.conflicts
+
+    def contradiction_found() -> bool:
+        for p, cand in list(st.chosen.items()):
+            specs = [s for s, _ in st.constraints.get(p, [])]
+            if not all(s.contains(cand.version) for s in specs):
+                return True
+        items = sorted(st.chosen.items())
+        for i, (_, a) in enumerate(items):
+            for _, b in items[i + 1:]:
+                if conflicts_with(a, b):
+                    return True
+        return False
+
+    def detect_cycle() -> bool:
+        edges: Dict[str, List[str]] = {p: [] for p in st.chosen}
+        for p, cand in st.chosen.items():
+            for dep, _ in cand.dependencies:
+                if dep in st.chosen:
+                    edges[p].append(dep)
+        return _find_cycle(edges) is not None
+
+    def fixed_cost() -> int:
+        """已确定选择相对 baseline 的代价（完整方案代价的下界）。"""
+        total = 0
+        for p, cand in st.chosen.items():
+            bv = base_versions.get(p)
+            if bv is None or cand.version != bv:
+                total += 1
+        return total
+
+    def apply_choice(plugin: str, cand: Candidate) -> List[str]:
+        st.chosen[plugin] = cand
+        added: List[str] = []
+        for dep, spec in cand.dependencies:
+            st.constraints.setdefault(dep, []).append((spec, plugin))
+            added.append(dep)
+        return added
+
+    def rollback(plugin: str, added: List[str]) -> None:
+        st.chosen.pop(plugin, None)
+        for dep in added:
+            lst = st.constraints.get(dep)
+            if not lst:
+                continue
+            for i in range(len(lst) - 1, -1, -1):
+                if lst[i][1] == plugin:
+                    lst.pop(i)
+                    break
+            if not lst:
+                st.constraints.pop(dep, None)
+
+    def dfs() -> None:
+        nonlocal best_plan, best_cost
+        if contradiction_found():
+            return
+        # 已选代价已达到当前最优，剩余选择只会持平或更差，剪枝
+        # （持平不替换 => 并列时保留默认枚举顺序下更靠前的方案）。
+        if fixed_cost() >= best_cost:
+            return
+
+        unassigned = sorted(p for p in st.constraints if p not in st.chosen)
+        feasible = {p: feasible_candidates(p) for p in unassigned}
+        if any(len(cs) == 0 for cs in feasible.values()):
+            return
+
+        if not unassigned:
+            if detect_cycle():
+                return
+            removed = sum(1 for p in base_versions if p not in st.chosen)
+            total = fixed_cost() + removed
+            if total < best_cost:
+                best_cost = total
+                best_plan = dict(st.chosen)
+            return
+
+        # 与 solve 相同的 MRV 变量顺序：候选最少者优先，平手按插件名
+        _, plugin = min(
+            ((len(feasible[p]), p) for p in unassigned),
+            key=lambda x: (x[0], x[1]),
+        )
+        for cand in feasible[plugin]:  # 已按版本降序
+            added = apply_choice(plugin, cand)
+            dfs()
+            rollback(plugin, added)
+
+    dfs()
+    return best_plan
 
 
 def _dedup(reasons: List[dict]) -> List[dict]:

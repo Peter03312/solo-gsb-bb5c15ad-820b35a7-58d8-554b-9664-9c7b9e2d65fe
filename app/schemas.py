@@ -125,6 +125,52 @@ class SolutionOut(BaseModel):
     created_at: datetime
 
 
+# ----------------------------------------------------------- 预演（不落库）
+
+class RehearseRequest(BaseModel):
+    # 目标目录修订号（必填）：只从该修订的可见（未撤销）版本中求解
+    revision: int = Field(..., ge=0)
+    # 缺省 / null：沿用原方案运行环境；传入（含空列表）即整体覆盖
+    runtimes: list[RuntimeIn] | None = None
+    # 缺省 / null：沿用原方案目标约束；传入（含列表形式）即整体覆盖
+    targets: dict[str, str] | list[DependencyIn] | None = None
+
+    @field_validator("targets")
+    @classmethod
+    def _targets(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            if not v:
+                raise ValueError("targets 不能为空")
+            return {validate_plugin_name(k): str(spec or "") for k, spec in v.items()}
+        if not v:
+            raise ValueError("targets 不能为空")
+        return {validate_plugin_name(d.plugin): d.spec for d in v}
+
+
+class DiffItem(BaseModel):
+    plugin: str
+    change: str  # kept 保留 / added 新增 / removed 移除 / changed 换版
+    from_version: str | None
+    to_version: str | None
+
+
+class RehearsalOut(BaseModel):
+    baseline_solution_id: int
+    baseline_revision: int
+    revision: int
+    saved: bool = False
+    request_hash: str
+    runtimes_overridden: bool
+    targets_overridden: bool
+    effective_request: dict
+    selection: dict[str, SelectedItem]
+    install_order: list[str]
+    diff: list[DiffItem]
+    changes: dict[str, int]
+
+
 class ConflictDetail(BaseModel):
     detail: str
     code: str
