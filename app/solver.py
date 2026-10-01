@@ -190,10 +190,46 @@ def solve(
     targets: Dict[str, SpecifierSet],
 ) -> Dict[str, Candidate]:
     """求完整方案；失败抛 :class:`UnsatisfiableError` 或 :class:`CycleError`。"""
+    return _solve_engine(snapshot, runtimes, targets, baseline=None)
+
+
+def solve_minimal_change(
+    snapshot: Snapshot,
+    runtimes: Sequence[RuntimeRequirement],
+    targets: Dict[str, SpecifierSet],
+    baseline_versions: Dict[str, Version],
+) -> Dict[str, Candidate]:
+    """在全部完整方案中求相对 ``baseline_versions`` 变动最少的一个。
+
+    用于“历史方案预演”：新增（baseline 没有）、移除（baseline 有但新方案
+    没有）、换版（同一插件版本不同）各计一次，保留计 0。变动数平手时保留
+    :func:`solve` 的确定性结果 —— 引擎以相同的 MRV + 版本降序 DFS 枚举，
+    平手分支保留第一个找到的完整方案。
+    """
+    return _solve_engine(
+        snapshot, runtimes, targets, baseline=dict(baseline_versions))
+
+
+def _solve_engine(
+    snapshot: Snapshot,
+    runtimes: Sequence[RuntimeRequirement],
+    targets: Dict[str, SpecifierSet],
+    baseline: Optional[Dict[str, Version]],
+) -> Dict[str, Candidate]:
+    """求解引擎。
+
+    ``baseline is None``：经典模式，返回 DFS 找到的第一个完整方案。
+    ``baseline`` 给定时：分支定界枚举全部完整方案，返回变动数最小者。
+    """
     st = _State(snapshot=snapshot, runtimes=tuple(runtimes))
     reasons: List[dict] = []
     cycle_seen: List[List[str]] = []
     choice_depth: Dict[str, int] = {}
+    # 最小变动模式的当前最优；经典模式不使用
+    best: List[Optional[Dict[str, Candidate]]] = [None]
+    best_cost: List[int] = [10**18]
+    # 经典模式的第一个完整方案
+    first: List[Optional[Dict[str, Candidate]]] = [None]
 
     for plugin in sorted(targets):
         st.constraints.setdefault(plugin, []).append((targets[plugin], None))
@@ -215,6 +251,34 @@ def solve(
 
     def conflicts_with(a: Candidate, b: Candidate) -> bool:
         return b.plugin in a.conflicts or a.plugin in b.conflicts
+
+    def full_cost(plan: Dict[str, Candidate]) -> int:
+        """完整方案相对 baseline 的变动插件数（新增/换版/移除各 1）。"""
+        total = 0
+        for p, cand in plan.items():
+            old = baseline.get(p) if baseline is not None else None
+            if old is None or cand.version != old:
+                total += 1
+        if baseline is not None:
+            total += sum(1 for p in baseline if p not in plan)
+        return total
+
+    def lower_bound() -> int:
+        """当前前缀上单调的变动数下界。
+
+        只计入沿搜索延伸不可能再减少的部分：已选插件中的新增/换版，
+        以及已进入约束集合必被选入、但 baseline 中不存在的插件（必新增）。
+        baseline 中尚未进入约束的插件不计入（未来可能被保留，计入会破坏单调性）。
+        """
+        lb = 0
+        for p, cand in st.chosen.items():
+            old = baseline.get(p)
+            if old is None or cand.version != old:
+                lb += 1
+        for p in st.constraints:
+            if p not in st.chosen and p not in baseline:
+                lb += 1
+        return lb
 
     def contradiction():
         """检查已选集合上的范围矛盾与互斥。
@@ -306,7 +370,21 @@ def solve(
                 })
                 # 环上最深的选择帧是最近的可解除点
                 raise _Backtrack(max(choice_depth[p] for p in cyc[:-1]))
-            return dict(st.chosen)
+            plan = dict(st.chosen)
+            if baseline is None:
+                first[0] = plan
+                return plan
+            # 最小变动模式：分支定界。首个完整方案即确定性参考方案，
+            # 只有变动数严格更小时才替换 —— 平手保留先找到者。
+            cost = full_cost(plan)
+            if cost < best_cost[0]:
+                best[0] = plan
+                best_cost[0] = cost
+            raise _Backtrack(depth - 1)  # 继续枚举其余完整方案
+
+        if baseline is not None and lower_bound() > best_cost[0]:
+            # 下界已不可能优于当前最优；剪到本插件的上一选择帧换候选
+            raise _Backtrack(depth - 1)
 
         # MRV：可行候选最少的插件先选，平手按插件名
         pending = sorted(
@@ -372,11 +450,14 @@ def solve(
         return max(choice_depth[src] for src in sources)
 
     try:
-        result: Optional[Dict[str, Candidate]] = recurse(0)
+        recurse(0)
     except _Backtrack:
-        result = None
-    if result is not None:
-        return result
+        pass
+
+    if baseline is not None and best[0] is not None:
+        return best[0]
+    if baseline is None and first[0] is not None:
+        return first[0]
 
     if cycle_seen:
         non_cycle = [r for r in reasons if r["type"] != "dependency_cycle"]
@@ -419,3 +500,39 @@ def installation_order(plan: Dict[str, Candidate]) -> List[str]:
                 ready.append(q)
                 ready.sort()
     return order
+
+
+def plan_diff(
+    baseline_versions: Dict[str, Version],
+    plan: Dict[str, Candidate],
+) -> Dict[str, dict]:
+    """逐插件对比原方案与新方案，动作分为 keep/change/add/remove。
+
+    * keep：插件在两方案中均存在且版本相同；
+    * change：同一插件存在于两方案但版本不同（换版）；
+    * add：原方案没有、新方案新增；
+    * remove：原方案有、新方案移除。
+    """
+    out: Dict[str, dict] = {}
+    for name in sorted(plan):
+        new_version = str(plan[name].version)
+        old = baseline_versions.get(name)
+        if old is None:
+            out[name] = {"action": "add", "from_version": None,
+                         "to_version": new_version}
+        elif old == plan[name].version:
+            out[name] = {"action": "keep", "from_version": str(old),
+                         "to_version": new_version}
+        else:
+            out[name] = {"action": "change", "from_version": str(old),
+                         "to_version": new_version}
+    for name in sorted(baseline_versions):
+        if name not in plan:
+            out[name] = {"action": "remove", "from_version": str(baseline_versions[name]),
+                         "to_version": None}
+    return out
+
+
+def change_count(diff: Dict[str, dict]) -> int:
+    """新增、移除、换版的插件总数（keep 不计）。"""
+    return sum(1 for d in diff.values() if d["action"] != "keep")

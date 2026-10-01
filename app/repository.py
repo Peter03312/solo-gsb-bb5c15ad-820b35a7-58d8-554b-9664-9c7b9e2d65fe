@@ -229,7 +229,14 @@ def save_solution(db: Any, *, revision: int, request_hash: str,
     return sol
 
 
-def revoked_flags(db: Any, version_ids: Iterable[int]) -> dict[int, bool]:
+def revoked_flags(db: Any, version_ids: Iterable[int],
+                  as_of_revision: int | None = None) -> dict[int, bool]:
+    """版本撤销标记。
+
+    ``as_of_revision`` 为空：返回**当前**是否已撤销（历史方案查询用，
+    已撤销版本会带 revoked=true）。给定修订号 R：返回该版本在修订 R
+    时点是否已撤销（求解/预演选到的版本在 R 必可见，恒为 false）。
+    """
     o = _orm()
     ids = list(set(version_ids))
     if not ids:
@@ -238,4 +245,7 @@ def revoked_flags(db: Any, version_ids: Iterable[int]) -> dict[int, bool]:
         o.select(o.PluginVersion.id, o.PluginVersion.revoked_revision)
         .where(o.PluginVersion.id.in_(ids))
     ).all()
-    return {row[0]: row[1] is not None for row in rows}
+    if as_of_revision is None:
+        return {row[0]: row[1] is not None for row in rows}
+    return {row[0]: row[1] is not None and row[1] <= as_of_revision
+            for row in rows}

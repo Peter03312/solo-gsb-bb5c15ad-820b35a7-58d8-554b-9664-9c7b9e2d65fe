@@ -10,20 +10,28 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from . import repository
+from . import database
 from .config import settings
-from .database import Base, SessionLocal, engine
+from .database import Base, SessionLocal
 from .models import CatalogRevision
 from .routers import router
 
 
 def init_db() -> None:
-    Base.metadata.create_all(bind=engine)
+    Base.metadata.create_all(bind=database.engine)
     db = SessionLocal()
     try:
-        if repository.latest_revision(db) == 0:
-            db.add(CatalogRevision(kind="init", plugin=None, version=None,
-                                   note="初始空目录修订"))
+        from sqlalchemy import func, insert, select
+        empty = db.execute(
+            select(func.count()).select_from(CatalogRevision)).scalar() == 0
+        if empty:
+            # 显式写 revision=0：ORM 默认对该自增列省略主键，在 SQLite 上
+            # 会落到隐式 rowid=1；用核心 INSERT 固定第 0 号修订后，
+            # 后续发布/撤销自然从 1 开始（显式赋值不推进序列/IDENTITY，
+            # PostgreSQL 上首个隐式插入同样为 1）。
+            db.execute(insert(CatalogRevision).values(
+                revision=0, kind="init", plugin=None, version=None,
+                note="初始空目录修订"))
             db.commit()
     finally:
         db.close()

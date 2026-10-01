@@ -24,10 +24,10 @@ from .config import settings
 from .database import get_db
 from .models import CatalogRevision, Plugin, PluginVersion, Solution
 from .schemas import (
-    PublishMetadata, RevisionOut, RevokeIn, SolutionOut, SolveRequest,
-    VersionOut,
+    PreviewOut, PreviewRequest, PublishMetadata, RevisionOut, RevokeIn,
+    SolutionOut, SolveRequest, VersionOut,
 )
-from .service import RequestError, annotate_revoked
+from .service import RequestError, SolutionNotFound, annotate_revoked
 from .solver import CycleError, UnsatisfiableError
 from .version import InvalidSpecifier
 
@@ -87,6 +87,7 @@ async def publish(
     # 流式落到临时文件，限制大小
     fd, tmp_path = tempfile.mkstemp(prefix="upload-", suffix=".pkg")
     too_large = False
+    size = 0
     try:
         with os.fdopen(fd, "wb") as out:
             while True:
@@ -115,7 +116,7 @@ async def publish(
             # 重复版本 409；摘要/范围/互斥自身等 422
             status = 409 if ("不可改写" in str(e) or "已发布" in str(e)) else 422
             raise HTTPException(status_code=status, detail=str(e))
-        except IntegrityError as e:
+        except IntegrityError:
             db.rollback()
             # 极端并发下的唯一约束竞争
             raise HTTPException(status_code=409, detail="同名同版本已存在（并发冲突）")
@@ -241,8 +242,7 @@ def solve(body: SolveRequest, db: Session = Depends(get_db),
     # 关键：求解必须固定在同一目录修订上。
     # PostgreSQL 用 REPEATABLE READ 事务快照；其它方言（测试用 SQLite）
     # 的单写连接天然等价，跳过该选项以免方言报错。
-    if db.bind.dialect.name == "postgresql":
-        db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+    _set_snapshot_isolation(db)
 
     try:
         revision = service.resolve_revision(db, body.revision)
@@ -291,7 +291,7 @@ def solve(body: SolveRequest, db: Session = Depends(get_db),
             revision=outcome.revision)
 
     row = outcome.solution_row
-    selection = annotate_revoked(db, outcome.selection)
+    selection = annotate_revoked(db, outcome.selection, outcome.revision)
     return SolutionOut(
         solution_id=row.id,
         revision=outcome.revision,
@@ -317,6 +317,95 @@ def get_solution(solution_id: int, db: Session = Depends(get_db)):
         selection=_ordered_selection(selection),
         install_order=row.install_order,
         created_at=row.created_at,
+    )
+
+
+# ------------------------------------------------------------ 方案预演（不保存）
+
+def _set_snapshot_isolation(db: Session) -> None:
+    """预演/求解固定在同一目录修订快照上（PostgreSQL REPEATABLE READ）。"""
+    if db.bind.dialect.name == "postgresql":
+        db.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+
+
+def _safe_preview_request_hash(row: Solution | None, body: PreviewRequest) -> str:
+    """对预演的合并后有效请求计算规范化哈希，供失败回显；解析失败返回空串。"""
+    if row is None:
+        return ""
+    try:
+        (_, targets_plain, runtime_reqs, _, _) = service.effective_request(
+            row, runtimes_in=body.runtimes, targets_in=body.targets)
+        h, _ = catalog.canonical_request(runtime_reqs, targets_plain)
+        return h
+    except RequestError:
+        return ""
+
+
+@router.post("/solutions/{solution_id}/preview", response_model=PreviewOut,
+             tags=["solve"])
+def preview_solution(solution_id: int, body: PreviewRequest,
+                     db: Session = Depends(get_db)):
+    """对已保存方案在目标修订上做只读预演：最小变动优先，不保存任何结果。"""
+    _set_snapshot_isolation(db)
+
+    try:
+        revision = service.resolve_revision(db, body.revision)
+    except RequestError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+    row = db.get(Solution, solution_id)
+    if row is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=f"方案 {solution_id} 不存在")
+
+    request_hash = _safe_preview_request_hash(row, body)
+
+    try:
+        outcome = service.preview(
+            db,
+            solution_id=solution_id,
+            revision=revision,
+            runtimes_in=body.runtimes,
+            targets_in=body.targets,
+        )
+    except RequestError as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    except SolutionNotFound as e:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(e))
+    except (UnsatisfiableError, CycleError) as e:
+        db.rollback()
+        code = "dependency_cycle" if isinstance(e, CycleError) else "unsatisfiable"
+        status = 422 if isinstance(e, CycleError) else 409
+        raise HTTPException(status_code=status, detail={
+            "detail": str(e),
+            "code": code,
+            "revision": revision,
+            "source_solution_id": solution_id,
+            "request_hash": request_hash,
+            "conflicts": e.reasons,
+        })
+    except InvalidSpecifier as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # 预演不写任何东西：显式回滚结束只读事务
+    db.rollback()
+
+    selection = annotate_revoked(db, outcome.selection, outcome.revision)
+    return PreviewOut(
+        source_solution_id=outcome.source_solution_id,
+        revision=outcome.revision,
+        saved=False,
+        request_hash=outcome.request_hash,
+        runtimes=outcome.effective_runtimes,
+        targets=outcome.effective_targets,
+        selection=_ordered_selection(selection),
+        install_order=outcome.install_order,
+        change_counts=outcome.change_counts,
+        changes={k: outcome.changes[k] for k in sorted(outcome.changes)},
     )
 
 

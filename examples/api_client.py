@@ -74,6 +74,10 @@ class Client:
     def solve(self, req: dict):
         return self._request("POST", "/solutions", data=req)
 
+    def preview(self, solution_id: int, req: dict):
+        return self._request(
+            "POST", f"/solutions/{solution_id}/preview", data=req)
+
     def solution(self, sid: int):
         return self._request("GET", f"/solutions/{sid}")
 
@@ -161,6 +165,60 @@ def main() -> int:
     show(f"在旧修订 {old_rev} 重放", st,
          {"revision": replay["revision"], "alpha": replay["selection"]["alpha"]["version"]})
     assert replay["selection"]["alpha"]["version"] == "2.0.0"
+
+    # ------------------------------------------------------------ 方案预演
+    # 再发布 alpha 2.1.0 与 beta 2.0.0（beta2 依赖 alpha>=2.1）
+    pub("alpha", "2.1.0", [{"name": "python", "spec": ">=3.10"}],
+        content="alpha21")
+    pub("beta", "2.0.0",
+        [{"name": "python", "spec": ">=3.10"}],
+        deps=[{"plugin": "alpha", "spec": ">=2.1"}], content="beta2")
+    latest_rev = c.revisions()[2][0]["revision"]
+
+    # 预演 1：同输入在原修订上 → 全部 keep，变动 0，不保存
+    st, _, pv = c.preview(sid, {"revision": old_rev})
+    show(f"预演：原修订 {old_rev} 重放（应 0 变动、saved=false）", st, {
+        "saved": pv["saved"], "change_counts": pv["change_counts"],
+        "changes": pv["changes"]})
+    assert st == 200 and pv["change_counts"]["changed"] == 0
+    assert pv["saved"] is False
+
+    # 预演 2：在最新修订上覆盖目标为 beta 最新
+    # 最小变动：alpha 2.0->2.1、beta 1.0->2.0，各计一次换版
+    st, _, pv2 = c.preview(sid, {
+        "revision": latest_rev,
+        "runtimes": [{"name": "python", "spec": "3.11.*"}],
+        "targets": {"beta": ">=2"}})
+    show(f"预演：修订 {latest_rev} 升级到 beta2（应 2 次换版）", st, {
+        "selection": {k: v["version"] for k, v in pv2["selection"].items()},
+        "install_order": pv2["install_order"],
+        "change_counts": pv2["change_counts"],
+        "changes": pv2["changes"]})
+    assert st == 200
+    assert pv2["selection"]["alpha"]["version"] == "2.1.0"
+    assert pv2["selection"]["beta"]["version"] == "2.0.0"
+    assert pv2["install_order"] == ["alpha", "beta"]
+    assert pv2["change_counts"]["change"] == 2
+
+    # 预演 3：覆盖为不兼容运行环境 python 3.9 → 409 结构化原因，不保存
+    st, _, err = c.preview(sid, {
+        "revision": latest_rev,
+        "runtimes": [{"name": "python", "spec": "3.9.*"}],
+        "targets": {"beta": ">=2"}})
+    show("预演无解：beta2 不支持 python 3.9（409，不保存部分方案）", st, err)
+    assert st == 409 and err["detail"]["code"] == "unsatisfiable"
+
+    # 预演 4：非法范围 / 不存在方案 / 不存在修订 → 明确拒绝
+    st, _, bad = c.preview(sid, {"revision": latest_rev,
+                                 "targets": {"beta": "~=1"}})
+    show("预演拒绝：非法覆盖约束（400）", st, bad)
+    assert st == 400
+    st, _, bad = c.preview(999999, {"revision": latest_rev})
+    show("预演拒绝：方案不存在（404）", st, bad)
+    assert st == 404
+    st, _, bad = c.preview(sid, {"revision": 999999})
+    show("预演拒绝：修订不存在（400）", st, bad)
+    assert st == 400
 
     # 摘要不符必须拒绝
     bad = {"plugin": "alpha", "version": "9.9.9", "sha256": "0" * 64,

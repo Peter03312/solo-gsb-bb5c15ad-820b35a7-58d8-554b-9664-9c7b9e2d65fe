@@ -25,6 +25,10 @@ from .database import Base
 # PostgreSQL 上使用原生 JSONB；其它方言（如测试用 SQLite）回退到通用 JSON
 JSONB = JSON().with_variant(PG_JSONB(), "postgresql").with_variant(JSON(), "sqlite")
 
+# SQLite 仅对声明类型恰为 INTEGER 的主键做 rowid 自增；生产 PostgreSQL
+# 仍使用 BIGINT 主键。外键列保持 BigInteger（SQLite 对类型亲和不敏感）。
+BigIntPK = BigInteger().with_variant(Integer(), "sqlite")
+
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -45,7 +49,7 @@ class CatalogRevision(Base):
 class Plugin(Base):
     __tablename__ = "plugins"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -60,7 +64,7 @@ class PluginVersion(Base):
         Index("ix_pv_lifecycle", "published_revision", "revoked_revision"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
     plugin_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("plugins.id", ondelete="RESTRICT"), nullable=False)
     version: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -92,7 +96,7 @@ class Dependency(Base):
         UniqueConstraint("source_id", "dep_plugin", name="uq_dependency"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
     source_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("plugin_versions.id", ondelete="CASCADE"), nullable=False)
     dep_plugin: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -108,7 +112,7 @@ class VersionRuntime(Base):
         UniqueConstraint("version_id", "name", name="uq_version_runtime"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
     version_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("plugin_versions.id", ondelete="CASCADE"), nullable=False)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -124,7 +128,7 @@ class Conflict(Base):
         UniqueConstraint("source_id", "conflict_plugin", name="uq_conflict"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
     source_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("plugin_versions.id", ondelete="CASCADE"), nullable=False)
     conflict_plugin: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -140,7 +144,7 @@ class Solution(Base):
         UniqueConstraint("revision_id", "request_hash", name="uq_solution_request"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True)
     revision_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("catalog_revisions.revision"), nullable=False, index=True)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)

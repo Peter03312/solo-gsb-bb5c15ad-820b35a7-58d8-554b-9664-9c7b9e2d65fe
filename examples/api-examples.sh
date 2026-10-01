@@ -110,4 +110,40 @@ curl -fsS -D - -o "$tmpdir/dtk.bin" \
   "$API/plugins/data-toolkit/versions/3.0.0/download" | grep -Ei 'HTTP|x-sha256|content-disposition'
 echo "本地校验：$(sha256_file "$tmpdir/dtk.bin")"
 
+# 11) 方案预演（dry-run）：对已保存方案 #SOL_ID 做不保存的“如果……会怎样”
+# 再发布 numpy 2.2.0 与 data-toolkit 3.1.0（3.1 依赖 numpy>=2.2）
+publish numpy 2.2.0 '{"plugin":"numpy","version":"2.2.0",
+  "runtimes":[{"name":"python","spec":">=3.10"}]}' "numpy-2.2.0-payload"
+publish data-toolkit 3.1.0 '{"plugin":"data-toolkit","version":"3.1.0",
+  "runtimes":[{"name":"python","spec":">=3.10"}],
+  "dependencies":[{"plugin":"numpy","spec":">=2.2"}]}' "dtk-3.1.0"
+LATEST_REV="$(curl -fsS "$API/revisions" | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["revision"])')"
+
+# 注意：第 7 步撤销过 numpy 2.1.0；原方案在其原修订上重放仍全部 keep
+echo ">>> 预演：原修订 $OLD_REV 上重放（应 0 变动）"
+curl -fsS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$OLD_REV}" \
+  "$API/solutions/$SOL_ID/preview" | python3 -m json.tool
+
+# 在最新修订上覆盖目标为 data-toolkit>=3.1：最小变动 = 两处换版
+echo ">>> 预演：修订 $LATEST_REV 上升级到 data-toolkit 3.1（应 2 次换版）"
+curl -fsS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$LATEST_REV,
+       \"runtimes\":[{\"name\":\"python\",\"spec\":\"3.11.*\"}],
+       \"targets\":{\"data-toolkit\":\">=3.1\"}}" \
+  "$API/solutions/$SOL_ID/preview" | tee "$tmpdir/preview.json" | python3 -m json.tool
+
+echo ">>> 预演结果不落库：方案 $SOL_ID 原样可查"
+curl -fsS "$API/solutions/$SOL_ID" \
+  | python3 -c 'import json,sys;s=json.load(sys.stdin);print("saved selection:",
+        {k:v["version"] for k,v in s["selection"].items()})'
+
+# 无解预演：409 + 结构化冲突，不保存任何部分方案
+echo ">>> 预演无解（data-toolkit>=3.1 但 python 3.9）"
+curl -sS -X POST "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d "{\"revision\":$LATEST_REV,
+       \"runtimes\":[{\"name\":\"python\",\"spec\":\"3.9.*\"}],
+       \"targets\":{\"data-toolkit\":\">=3.1\"}}" \
+  "$API/solutions/$SOL_ID/preview" | python3 -m json.tool || true
+
 echo "全部示例执行完成。"

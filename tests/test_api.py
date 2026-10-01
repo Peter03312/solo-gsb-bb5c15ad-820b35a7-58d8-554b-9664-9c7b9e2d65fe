@@ -40,28 +40,33 @@ class ApiTests(unittest.TestCase):
         os.environ["DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
         os.environ["PACKAGE_DIR"] = cls.tmp
 
-        # 静态隔离：每次都重新导入受配置影响的模块
-        for name in list(sys.modules):
-            if name.startswith("app."):
-                del sys.modules[name]
+        # 静态隔离：首次运行时导入受配置影响的模块
+        if "app.main" not in sys.modules:
+            for name in list(sys.modules):
+                if name.startswith("app."):
+                    del sys.modules[name]
 
+        import importlib
+        importlib.import_module("app.models")  # 注册表元数据
+        importlib.import_module("app.main")    # 加载 FastAPI 应用与路由
+
+    def setUp(self):
+        # 每个用例一个全新的内存库，避免插件名/修订号跨用例相互影响
         from fastapi.testclient import TestClient
         from sqlalchemy import create_engine
         from sqlalchemy.pool import StaticPool
 
         from app import database
-        cls.engine = create_engine(
+        from app.main import app, init_db
+        self.engine = create_engine(
             "sqlite+pysqlite:///:memory:",
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
-        database.engine = cls.engine
-        database.SessionLocal.configure(bind=cls.engine)
-
-        import app.models as models  # noqa: F401
-        from app.main import app, init_db
+        database.engine = self.engine
+        database.SessionLocal.configure(bind=self.engine)
         init_db()
-        cls.client = TestClient(app)
+        self.client = TestClient(app)
 
     # ------------------------------------------------------------ helpers
     def publish(self, plugin, version, payload, deps=None, rts=None, conflicts=None,
@@ -224,6 +229,202 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 409)
         self.assertTrue(any(c["type"] == "mutex_conflict"
                             for c in r.json()["detail"]["conflicts"]))
+
+    # -------------------------------------------------- 方案预演（dry-run）
+    def _preview_fixture(self):
+        # lib 三个版本；toolz 1 -> lib>=1，toolz 2 -> lib>=2
+        self.publish("pv-lib", "1.0.0", b"lib1")
+        self.publish("pv-lib", "2.0.0", b"lib2")
+        self.publish("pv-lib", "3.0.0", b"lib3")
+        self.publish("pv-toolz", "1.0.0", b"toolz1",
+                     deps=[{"plugin": "pv-lib", "spec": ">=1"}])
+        self.publish("pv-toolz", "2.0.0", b"toolz2",
+                     deps=[{"plugin": "pv-lib", "spec": ">=2"}])
+        sol = self.client.post("/api/v1/solutions",
+                               json={"targets": {"pv-toolz": ""}})
+        self.assertEqual(sol.status_code, 200, sol.text)
+        body = sol.json()
+        self.assertEqual(body["selection"]["pv-lib"]["version"], "3.0.0")
+        self.assertEqual(body["selection"]["pv-toolz"]["version"], "2.0.0")
+        return body["solution_id"], body["revision"]
+
+    def test_preview_same_revision_is_all_keep_and_not_saved(self):
+        sid, rev = self._preview_fixture()
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": rev})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body["saved"])
+        self.assertEqual(body["revision"], rev)
+        self.assertEqual(body["source_solution_id"], sid)
+        self.assertEqual(body["change_counts"],
+                         {"keep": 2, "change": 0, "add": 0, "remove": 0,
+                          "changed": 0})
+        self.assertTrue(all(v["action"] == "keep"
+                            for v in body["changes"].values()))
+        self.assertEqual(body["install_order"], ["pv-lib", "pv-toolz"])
+        # 预演沿用原请求：回显目标/运行环境
+        self.assertEqual(body["targets"], {"pv-toolz": ""})
+        # 预演不产生新方案：同 ID 查询结果仍是原方案
+        hist = self.client.get(f"/api/v1/solutions/{sid}").json()
+        self.assertEqual(hist["selection"]["pv-lib"]["version"], "3.0.0")
+
+    def test_preview_targets_override_keeps_lib_one_change(self):
+        sid, rev = self._preview_fixture()
+        # 覆盖目标为 toolz<2：lib3.0 同时满足 toolz1 的 lib>=1，
+        # 最小变动 = 仅换版 toolz，lib 保留（keep）
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": rev,
+                                   "targets": {"pv-toolz": "<2"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["targets"], {"pv-toolz": "<2"})
+        self.assertEqual(body["selection"]["pv-toolz"]["version"], "1.0.0")
+        self.assertEqual(body["selection"]["pv-lib"]["version"], "3.0.0")
+        self.assertEqual(body["changes"]["pv-toolz"],
+                         {"action": "change", "from_version": "2.0.0",
+                          "to_version": "1.0.0"})
+        self.assertEqual(body["changes"]["pv-lib"],
+                         {"action": "keep", "from_version": "3.0.0",
+                          "to_version": "3.0.0"})
+        self.assertEqual(body["change_counts"],
+                         {"keep": 1, "change": 1, "add": 0, "remove": 0,
+                          "changed": 1})
+
+    def test_preview_targets_override_forces_both_change(self):
+        sid, rev = self._preview_fixture()
+        # 覆盖目标追加 lib<3：排除 lib3，保留 lib3 不可能，
+        # -> 换 toolz 且把 lib 降到 2.0：两次换版
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": rev,
+                                   "targets": {"pv-toolz": "<2", "pv-lib": "<3"}})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["targets"], {"pv-lib": "<3", "pv-toolz": "<2"})
+        self.assertEqual(body["selection"]["pv-toolz"]["version"], "1.0.0")
+        self.assertEqual(body["selection"]["pv-lib"]["version"], "2.0.0")
+        self.assertEqual(body["change_counts"],
+                         {"keep": 0, "change": 2, "add": 0, "remove": 0,
+                          "changed": 2})
+
+    def test_preview_runtimes_override_unsat_no_partial_save(self):
+        sid, rev = self._preview_fixture()
+        # lib 未声明任何运行环境约束 -> 无环境需求时必兼容；
+        # 换成声明 python>=3.10 的插件构造环境无解：直接用不存在插件目标
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": rev,
+                                   "targets": {"ghost-plugin": ""}})
+        self.assertEqual(r.status_code, 409, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["code"], "unsatisfiable")
+        self.assertEqual(detail["source_solution_id"], sid)
+        self.assertTrue(any(c["type"] == "missing_plugin"
+                            for c in detail["conflicts"]))
+
+    def test_preview_solution_not_found(self):
+        r = self.client.post("/api/v1/solutions/999999/preview",
+                             json={"revision": 0})
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_preview_revision_not_found(self):
+        sid, _ = self._preview_fixture()
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": 999999})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("不存在", r.json()["detail"])
+
+    def test_preview_invalid_override_rejected(self):
+        sid, rev = self._preview_fixture()
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": rev,
+                                   "targets": {"pv-toolz": "~=1"}})
+        self.assertEqual(r.status_code, 400, r.text)
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": rev, "targets": {}})
+        self.assertEqual(r.status_code, 422, r.text)
+
+    def test_preview_stable_after_later_publish_and_revoke(self):
+        sid, rev = self._preview_fixture()
+        # 首次预演：固定在 rev
+        r1 = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                              json={"revision": rev})
+        self.assertEqual(r1.status_code, 200, r1.text)
+
+        # 之后发布新版本并撤销旧版本
+        self.publish("pv-lib", "4.0.0", b"lib4")
+        self.client.post("/api/v1/plugins/pv-lib/versions/3.0.0/revoke",
+                         json={"reason": "x"})
+
+        # 相同输入 + 同一修订：结果稳定
+        r2 = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                              json={"revision": rev})
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(r2.json()["selection"], r1.json()["selection"])
+        self.assertEqual(r2.json()["changes"], r1.json()["changes"])
+        self.assertEqual(r2.json()["request_hash"], r1.json()["request_hash"])
+
+    def test_preview_on_later_revision_picks_up_changes(self):
+        sid, rev = self._preview_fixture()
+        # 发布 lib4，再撤销原方案选中的 lib3：在新修订上保留 lib3 已不可能，
+        # 预演必须换到可见版本；toolz2 允许 lib>=2，确定性选最新 lib4
+        self.publish("pv-lib", "4.0.0", b"lib4")
+        self.client.post("/api/v1/plugins/pv-lib/versions/3.0.0/revoke",
+                         json={"reason": "x"})
+        latest = self.client.get("/api/v1/revisions").json()[0]["revision"]
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": latest})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["selection"]["pv-lib"]["version"], "4.0.0")
+        self.assertEqual(body["changes"]["pv-lib"],
+                         {"action": "change", "from_version": "3.0.0",
+                          "to_version": "4.0.0"})
+        self.assertEqual(body["changes"]["pv-toolz"]["action"], "keep")
+
+    def test_preview_runtime_override_applied(self):
+        # 带运行环境的场景：新插件 pyonly 只支持 python>=3.10
+        self.publish("pv-py", "1.0.0", b"py",
+                     rts=[{"name": "python", "spec": ">=3.10"}])
+        sol = self.client.post("/api/v1/solutions",
+                               json={"runtimes": [{"name": "python",
+                                                   "spec": "3.11.*"}],
+                                     "targets": {"pv-py": ""}}).json()
+        sid, rev = sol["solution_id"], sol["revision"]
+        # 覆盖为 python 3.8：无解（409），结构化原因含运行环境阻塞
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": rev,
+                                   "runtimes": [{"name": "python",
+                                                 "spec": "3.8.*"}]})
+        self.assertEqual(r.status_code, 409, r.text)
+        conflicts = r.json()["detail"]["conflicts"]
+        self.assertTrue(any("python" in c.get("runtime_blocked", [])
+                            for c in conflicts))
+        # 沿用原运行环境仍可解；回显规范化后的运行环境（与 request_hash 一致）
+        r2 = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                              json={"revision": rev})
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(r2.json()["runtimes"],
+                         [{"name": "python", "spec": "==3.11.*"}])
+
+    def test_preview_cycle_returns_422(self):
+        # 先有一份已保存方案，再发布互依成环的两个插件，覆盖目标到环上
+        self.publish("pv-base", "1.0.0", b"base")
+        sol = self.client.post("/api/v1/solutions",
+                               json={"targets": {"pv-base": ""}}).json()
+        sid = sol["solution_id"]
+        self.publish("pv-ca", "1.0.0", b"ca",
+                     deps=[{"plugin": "pv-cb", "spec": ""}])
+        self.publish("pv-cb", "1.0.0", b"cb",
+                     deps=[{"plugin": "pv-ca", "spec": ""}])
+        latest = self.client.get("/api/v1/revisions").json()[0]["revision"]
+        r = self.client.post(f"/api/v1/solutions/{sid}/preview",
+                             json={"revision": latest, "runtimes": [],
+                                   "targets": {"pv-ca": ""}})
+        self.assertEqual(r.status_code, 422, r.text)
+        detail = r.json()["detail"]
+        self.assertEqual(detail["code"], "dependency_cycle")
+        cyc = detail["conflicts"][0]["cycle"]
+        self.assertEqual(cyc[0], cyc[-1])
 
 
 def _json(obj):

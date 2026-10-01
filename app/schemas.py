@@ -133,6 +133,62 @@ class ConflictDetail(BaseModel):
     conflicts: list[dict]
 
 
+# ----------------------------------------------------------- 方案预演（dry-run）
+
+class PreviewRequest(BaseModel):
+    """在目标修订上对已保存方案做不保存的预演。
+
+    目标修订号必填；runtimes / targets 任一字段给出即用完整列表覆盖原请求
+    的对应部分，省略则沿用原方案保存时的请求项。
+    """
+    revision: int = Field(..., description="目标目录修订号（必填）")
+    runtimes: list[RuntimeIn] | None = None
+    # 与 SolveRequest 相同，同时接受 {"name": "spec"} 或
+    # [{"plugin": ..., "spec": ...}]；None 表示沿用原方案目标
+    targets: dict[str, str] | list[DependencyIn] | None = None
+
+    @field_validator("targets")
+    @classmethod
+    def _targets(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, dict):
+            if not v:
+                raise ValueError("targets 不能为空（如需沿用原请求请省略该字段）")
+            return {validate_plugin_name(k): str(spec or "") for k, spec in v.items()}
+        if not v:
+            raise ValueError("targets 不能为空（如需沿用原请求请省略该字段）")
+        return {validate_plugin_name(d.plugin): d.spec for d in v}
+
+
+class PluginChange(BaseModel):
+    action: str  # keep / change / add / remove
+    from_version: str | None = None
+    to_version: str | None = None
+
+
+class ChangeCounts(BaseModel):
+    keep: int = 0
+    change: int = 0
+    add: int = 0
+    remove: int = 0
+    changed: int = 0  # = change + add + remove
+
+
+class PreviewOut(BaseModel):
+    """预演结果：不保存、不产生方案 ID；差异逐插件给出。"""
+    source_solution_id: int
+    revision: int
+    saved: bool = False
+    request_hash: str
+    runtimes: list[RuntimeIn]
+    targets: dict[str, str]
+    selection: dict[str, SelectedItem]
+    install_order: list[str]
+    change_counts: ChangeCounts
+    changes: dict[str, PluginChange]
+
+
 # ----------------------------------------------------------- 通用
 
 class RevisionOut(BaseModel):

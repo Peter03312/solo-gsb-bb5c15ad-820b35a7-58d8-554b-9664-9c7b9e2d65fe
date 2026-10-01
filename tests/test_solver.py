@@ -13,8 +13,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.solver import (
-    Candidate, CycleError, RuntimeRequirement, Snapshot, installation_order,
-    solve, UnsatisfiableError,
+    Candidate, CycleError, RuntimeRequirement, Snapshot, change_count,
+    installation_order, plan_diff, solve, solve_minimal_change,
+    UnsatisfiableError,
 )
 from app.version import (
     InvalidSpecifier, InvalidVersion, SpecifierSet, Version,
@@ -203,6 +204,132 @@ class SolverTests(unittest.TestCase):
         self.assertEqual(str(ok["a"].version), "1.0")
         with self.assertRaises(UnsatisfiableError):
             self.plan(snap, runtimes=[R("python", "3.10"), R("cuda", "10")], a="")
+
+
+class MinimalChangeTests(unittest.TestCase):
+    def setUp(self):
+        # lib 1.0/2.0/3.0；app 1.0 -> lib>=1，app 2.0 -> lib>=2
+        self.snap = Snapshot(1, {
+            "lib": (C("lib", "3.0"), C("lib", "2.0"), C("lib", "1.0")),
+            "app": (C("app", "2.0", [("lib", ">=2")]),
+                    C("app", "1.0", [("lib", ">=1")])),
+        })
+
+    def mc(self, baseline, **targets):
+        return solve_minimal_change(
+            self.snap, [],
+            {k: SpecifierSet.parse(v) for k, v in targets.items()},
+            {k: Version.parse(v) for k, v in baseline.items()})
+
+    def test_baseline_exact_is_zero_changes(self):
+        plan = self.mc({"app": "2.0", "lib": "2.0"}, app="")
+        self.assertEqual(str(plan["app"].version), "2.0")
+        self.assertEqual(str(plan["lib"].version), "2.0")
+        diff = plan_diff({k: Version.parse(v) for k, v in
+                          {"app": "2.0", "lib": "2.0"}.items()}, plan)
+        self.assertEqual(change_count(diff), 0)
+        self.assertTrue(all(d["action"] == "keep" for d in diff.values()))
+
+    def test_prefers_older_app_to_keep_lib(self):
+        # 新目标不再约束 app 版本：经典解是 app2/lib3（2 次变动），
+        # 最小变动应保留 lib2 并回退 app1（1 次变动）。
+        baseline = {"app": "1.0", "lib": "2.0"}
+        plan = self.mc(baseline, app="")
+        self.assertEqual({p: str(c.version) for p, c in plan.items()},
+                         {"app": "1.0", "lib": "2.0"})
+
+    def test_force_upgrade_counts_one_change(self):
+        plan = self.mc({"app": "1.0", "lib": "1.0"}, app=">=2")
+        self.assertEqual(str(plan["app"].version), "2.0")
+        # lib>=2：保留 lib 不可能；选与新约束兼容的最高 lib 3.0（平手按确定性）
+        self.assertEqual(str(plan["lib"].version), "3.0")
+        diff = plan_diff({k: Version.parse(v) for k, v in
+                          {"app": "1.0", "lib": "1.0"}.items()}, plan)
+        actions = {p: d["action"] for p, d in diff.items()}
+        self.assertEqual(actions, {"app": "change", "lib": "change"})
+        self.assertEqual(change_count(diff), 2)
+        self.assertEqual(diff["lib"], {"action": "change",
+                                       "from_version": "1.0",
+                                       "to_version": "3.0"})
+
+    def test_removed_plugin_when_target_dropped(self):
+        # 原方案含多余插件 extra；新目标仅 app：extra 无法作为依赖出现 -> 移除
+        snap = Snapshot(1, dict(self.snap.candidates_by_plugin,
+                                extra=(C("extra", "1.0"),)))
+        baseline = {"app": "1.0", "lib": "1.0", "extra": "1.0"}
+        plan = solve_minimal_change(
+            snap, [], {"app": SpecifierSet.parse("")},
+            {k: Version.parse(v) for k, v in baseline.items()})
+        diff = plan_diff({k: Version.parse(v) for k, v in baseline.items()}, plan)
+        self.assertEqual(diff["extra"]["action"], "remove")
+        self.assertIsNone(diff["extra"]["to_version"])
+        self.assertEqual(change_count(diff), 1)
+
+    def test_added_plugin_counted(self):
+        # baseline 只有 lib（历史目标恰好如此）；新目标 app -> 必新增 app
+        baseline = {"lib": "2.0"}
+        plan = self.mc(baseline, app="")
+        diff = plan_diff({k: Version.parse(v) for k, v in baseline.items()}, plan)
+        self.assertEqual(diff["app"]["action"], "add")
+        self.assertIsNone(diff["app"]["from_version"])
+        # lib2 被保留（app2 兼容），故仅新增 app 一次变动
+        self.assertEqual(str(plan["lib"].version), "2.0")
+        self.assertEqual(change_count(diff), 1)
+
+    def test_tie_falls_back_to_deterministic_solution(self):
+        # baseline lib1.0；目标 app>=2 强制 lib>=2，lib2/lib3 都满足：
+        # 都只有 1 次变动（换版），平手必须取经典解 lib3.0
+        plan = self.mc({"app": "1.0", "lib": "1.0"}, app=">=2")
+        classic = solve(self.snap, [], {"app": SpecifierSet.parse(">=2")})
+        self.assertEqual({p: str(c.version) for p, c in plan.items()},
+                         {p: str(c.version) for p, c in classic.items()})
+        self.assertEqual(str(plan["lib"].version), "3.0")
+
+    def test_unsat_raises_structured(self):
+        with self.assertRaises(UnsatisfiableError) as cm:
+            self.mc({"app": "1.0", "lib": "1.0"}, app=">=9")
+        self.assertTrue(any(r["type"] == "no_matching_version"
+                            for r in cm.exception.reasons))
+
+    def test_deterministic_minimal_change(self):
+        baseline = {"app": "1.0", "lib": "2.0"}
+        first = self.mc(baseline, app="")
+        second = self.mc(baseline, app="")
+        self.assertEqual({p: str(c.version) for p, c in first.items()},
+                         {p: str(c.version) for p, c in second.items()})
+
+    def test_baseline_version_invisible_does_not_pin(self):
+        # baseline 引用目标快照里不可见的 lib9（已撤销）：自动计为换版
+        plan = self.mc({"app": "1.0", "lib": "9.0"}, app="")
+        self.assertIn(str(plan["lib"].version), ("1.0", "2.0", "3.0"))
+        diff = plan_diff({"app": Version.parse("1.0"), "lib": Version.parse("9.0")},
+                         plan)
+        self.assertEqual(diff["lib"]["action"], "change")
+
+    def test_all_solutions_cycle_still_raises_cycle_error(self):
+        # 唯一可行链含环：最小变动模式也必须报 CycleError（422），
+        # 不能因分支定界剪枝而退化成普通无解（409）
+        snap = Snapshot(1, {
+            "a": (C("a", "1.0", [("b", "")]), C("a", "2.0")),
+            "b": (C("b", "1.0", [("a", "")]),),
+        })
+        baseline = {"a": Version.parse("2.0")}
+        with self.assertRaises(CycleError) as cm:
+            solve_minimal_change(
+                snap, [], {"a": SpecifierSet.parse("==1.0")}, baseline)
+        cyc = cm.exception.reasons[0]["cycle"]
+        self.assertEqual(cyc[0], cyc[-1])
+
+    def test_valid_solution_beats_cycle_branch(self):
+        # a2 独立合法，a1<->b1 含环；存在完整方案时不得误报环
+        snap = Snapshot(1, {
+            "a": (C("a", "2.0"), C("a", "1.0", [("b", "")])),
+            "b": (C("b", "1.0", [("a", "")]),),
+        })
+        plan = solve_minimal_change(
+            snap, [], {"a": SpecifierSet.parse("")}, {})
+        self.assertEqual(str(plan["a"].version), "2.0")
+        self.assertNotIn("b", plan)
 
 
 if __name__ == "__main__":

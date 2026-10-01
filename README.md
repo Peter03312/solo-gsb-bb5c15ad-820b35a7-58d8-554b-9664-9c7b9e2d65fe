@@ -148,6 +148,63 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 - 对旧修订号重放请求仍得到与当时一致的方案。
 - 已撤销版本再次撤销 → 409。
 
+### 方案预演（dry-run，不保存）
+
+`POST /api/v1/solutions/{solution_id}/preview`
+
+对一份**已保存方案**做“如果换到修订 R 会怎样”的只读预演：只求解、不保存、
+不产生方案号，后续发布或撤销都不会改变同一输入在同一修订上的历史预演结果。
+
+请求体：
+
+```json
+{
+  "revision": 12,
+  "runtimes": [{"name": "python", "spec": "3.11.*"}],
+  "targets": {"data-toolkit": ">=3", "numpy": ""}
+}
+```
+
+- `revision`（**必填**）：目标目录修订号；方案或修订不存在分别返回
+  **404 / 400** 明确拒绝。
+- `runtimes` 与 `targets` 均可省略：**给出即整段覆盖**原求解请求的对应部分
+  （不是合并到旧列表），省略则沿用该方案保存时的请求项。覆盖的范围语法
+  非法、目标名为空、运行环境重复等 → **400/422 拒绝**，不落任何结果。
+- 只从目标修订内**可见（未撤销）版本**中求满足传递依赖、运行环境与互斥
+  约束的完整方案；约束与环规则与 `POST /solutions` 完全一致。
+- **首要目标：相对原方案变动的插件数最少**——新增（原方案没有）、移除
+  （原方案有但新方案不再需要）、换版（同一插件版本不同）各计一次，保留
+  计 0。变动数平手时沿用既有确定性选择规则（版本降序 + MRV，第一个找到
+  的完整方案胜出）。
+- 响应含新方案 `selection`、依赖优先的 `install_order`、逐插件差异
+  `changes`（`keep`/`add`/`remove`/`change` + `from_version`/`to_version`）
+  与计数 `change_counts`，并回显本次实际生效的 `runtimes`/`targets`
+  与规范化 `request_hash`。
+- **无解返回 409、依赖环返回 422**，结构与求解端点一致（额外带
+  `source_solution_id`），**不保存任何部分方案**。
+
+响应示例：
+
+```json
+{
+  "source_solution_id": 7,
+  "revision": 12,
+  "saved": false,
+  "request_hash": "…",
+  "runtimes": [{"name": "python", "spec": "==3.11.*"}],
+  "targets": {"data-toolkit": ">=3", "numpy": ""},
+  "selection": { "…同求解响应…": "…" },
+  "install_order": ["numpy", "data-toolkit"],
+  "change_counts": {"keep": 1, "change": 1, "add": 0, "remove": 0, "changed": 1},
+  "changes": {
+    "numpy":        {"action": "keep",   "from_version": "2.1.0", "to_version": "2.1.0"},
+    "data-toolkit": {"action": "change", "from_version": "3.0.0", "to_version": "3.1.0"}
+  }
+}
+```
+
+预演是只读接口：即使配置了 `API_TOKEN` 也不需要鉴权（与其它读接口一致）。
+
 ---
 
 ## 4. HTTP API 一览（前缀 `/api/v1`）
@@ -157,6 +214,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | POST | `/plugins/{name}/versions` | 发布版本（multipart：`metadata` + `package`），201/409/422 |
 | POST | `/plugins/{name}/versions/{ver}/revoke` | 撤销版本 |
 | POST | `/solutions` | 求解并保存方案；409 无解 / 422 依赖环 |
+| POST | `/solutions/{id}/preview` | 对已保存方案在目标修订上只读预演（最小变动优先，不保存） |
 | GET  | `/solutions/{id}` | 查询历史方案（含当前撤销标记） |
 | GET  | `/revisions` | 目录修订列表（最新在前） |
 | GET  | `/revisions/{id}` | 单个修订 |
@@ -194,7 +252,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 启动服务后任选其一：
 
 ```bash
-# bash + curl：发布 4 个版本、求解、缓存、无解、撤销、历史查询、旧修订重放、下载
+# bash + curl：发布、求解、缓存、无解、撤销、历史查询、旧修订重放、下载、方案预演
 BASE=http://localhost:8080 bash examples/api-examples.sh
 
 # 纯标准库 Python（离线机器无需安装 requests）
@@ -221,6 +279,12 @@ curl -X POST http://localhost:8080/api/v1/solutions \
   -H 'Content-Type: application/json' \
   -d '{"runtimes":[{"name":"python","spec":"3.11.*"}],
        "targets":{"data-toolkit":">=3"}}'
+
+# 对已保存方案 7 在修订 12 上预演（runtimes 覆盖、targets 沿用原请求）
+curl -X POST http://localhost:8080/api/v1/solutions/7/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"revision":12,
+       "runtimes":[{"name":"python","spec":"3.12.*"}]}'
 ```
 
 ---
@@ -230,7 +294,7 @@ curl -X POST http://localhost:8080/api/v1/solutions \
 核心版本规则、求解器与发布/撤销业务规则不依赖任何第三方库：
 
 ```bash
-python3 tests/test_solver.py        # 19 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性
+python3 tests/test_solver.py        # 28 用例：PEP440、传递依赖、互斥、环、回溯、运行环境、确定性、最小变动预演
 python3 tests/test_catalog_flow.py  # 5 用例：发布校验/不可改写/摘要拒绝/快照/撤销语义/请求哈希（内存仓储）
 ```
 
@@ -238,12 +302,13 @@ API 端到端测试（需要 FastAPI/SQLAlchemy 环境，可用内存 SQLite，�
 
 ```bash
 pip install -r requirements.txt httpx
-python3 tests/test_api.py
+python3 tests/test_api.py          # 22 用例（含 9 个预演端到端用例）
 ```
 
 覆盖：摘要不符拒绝、非法范围拒绝、同名同版本不可改写、传递求解与缓存、
 409 冲突明细不落部分方案、422 环、撤销只影响后续求解且历史方案带标记、
-下载校验头、互斥端到端等。
+下载校验头、互斥端到端，以及预演的 0 变动重放、覆盖换版、无解不保存、
+方案/修订/覆盖约束非法拒绝、发布撤销后同修订结果稳定等。
 
 ---
 
@@ -257,11 +322,11 @@ app/
   models.py      # ORM：修订、插件、版本、依赖、运行环境、互斥、方案
   schemas.py     # Pydantic 请求/响应模型与入参校验
   version.py     # PEP 440 版本与范围（标准库实现，无第三方依赖）
-  solver.py      # 确定性回溯求解器（MRV + 冲突回溯 + 环检测）
+  solver.py      # 确定性回溯求解器（MRV + 冲突回溯 + 环检测）与最小变动预演、逐插件差异
   catalog.py     # 纯领域逻辑：发布校验、SHA-256、请求规范化哈希
   repository.py  # ORM 持久化：发布/撤销事务、修订快照、方案存取
-  service.py     # 求解编排：解析、缓存、序列化、撤销标记
-  routers.py     # HTTP 路由（PostgreSQL REPEATABLE READ 求解事务）
+  service.py     # 求解编排与预演编排：覆盖合并、缓存、序列化、撤销标记
+  routers.py     # HTTP 路由（PostgreSQL REPEATABLE READ 只读快照事务）
 examples/        # curl / Python 调用示例
 tests/           # 求解器单测、业务流内存测试、API 集成测试
 docker-compose.yml  Dockerfile  requirements.txt
@@ -276,3 +341,9 @@ docker-compose.yml  Dockerfile  requirements.txt
   与并发的发布/撤销事务完全隔离，方案不会跨修订拼装。
 - `solutions(revision_id, request_hash)` 唯一：相同输入在相同修订上复用
   同一方案，既保证“同请求同结果”，也自然消化并发重复求解。
+- 预演（`/solutions/{id}/preview`）复用同一快照加载与求解引擎，但运行在
+  只读事务中并以回滚结束，**绝不写入方案或修订**；其结果只取决于
+  （原方案、目标修订、合并后的有效请求），因此之后的发布/撤销不影响
+  在旧修订号上的历史预演结果。最小变动目标通过对同一确定性 DFS 的
+  分支定界枚举实现：以原方案版本为基线最小化新增/移除/换版数，平手保留
+  确定性 DFS 找到的第一个完整方案。
